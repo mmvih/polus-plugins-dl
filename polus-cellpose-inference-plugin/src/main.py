@@ -1,75 +1,156 @@
 import argparse
 import logging
-import os
-import sys
 from pathlib import Path
-from urllib.parse import urlparse
 import numpy as np
 import zarr
 from bfio import BioReader
-import models
-from utils import download_url_to_file
+import cellpose
+import cellpose.models as models
+import torch
+from concurrent.futures import ThreadPoolExecutor, wait
+    
+logging.getLogger('cellpose.core').setLevel(logging.CRITICAL)
+logging.getLogger('cellpose.models').setLevel(logging.CRITICAL)
+logging.getLogger('cellpose.io').setLevel(logging.CRITICAL)
 
 TILE_SIZE = 1024
 TILE_OVERLAP = 256
-urls = [
-    'https://www.cellpose.org/models/cytotorch_0',
-    'https://www.cellpose.org/models/cytotorch_1',
-    'https://www.cellpose.org/models/cytotorch_2',
-    'https://www.cellpose.org/models/cytotorch_3',
-    'https://www.cellpose.org/models/size_cytotorch_0.npy',
-    'https://www.cellpose.org/models/nucleitorch_0',
-    'https://www.cellpose.org/models/nucleitorch_1',
-    'https://www.cellpose.org/models/nucleitorch_2',
-    'https://www.cellpose.org/models/nucleitorch_3',
-    'https://www.cellpose.org/models/size_nucleitorch_0.npy']
 
+# Initialize the logger
+logging.basicConfig(format='%(asctime)s - %(name)-8s - %(levelname)-8s - %(message)s',
+                    datefmt='%d-%b-%y %H:%M:%S')
+logger = logging.getLogger("main")
+logger.setLevel(logging.INFO)
 
-def download_model_weights(pretrained_model, urls=urls):
-    """ Downloading model weights based on segmentation
+def segment_thread(input_path: Path,
+                   zfile: Path,
+                   x,y,z,
+                   model_cp,model_sz,
+                   diameter):
+    
+    root = zarr.open(str(zfile))
+    
+    with BioReader(input_path) as br:
+        x_min = max([0, x - TILE_OVERLAP])
+        x_max = min([br.X, x + TILE_SIZE + TILE_OVERLAP])
+        y_min = max([0, y - TILE_OVERLAP])
+        y_max = min([br.Y, y + TILE_SIZE + TILE_OVERLAP])
+        tile_img = br[y_min:y_max, x_min:x_max, z:z + 1, 0, 0].squeeze()
+        img = cellpose.transforms.convert_image(tile_img,[0,0],False,True,False)
+        if diameter is None:
+            diameter,_ = model_sz.eval(tile_img,
+                                       channels=[0,0])
+            
+        rescale = model_cp.diam_mean / np.array(diameter)
+            
+        prob = model_cp._run_cp(img[np.newaxis,...],
+                                rescale=rescale,
+                                resample=True,
+                                compute_masks=False)[2]
+        
+        x_overlap = x - x_min
+        x_min = x
+        x_max = min([br.X, x + TILE_SIZE])
+        y_overlap = y - y_min
+        y_min = y
+        y_max = min([br.Y, y + TILE_SIZE])
+        prob = prob[...,np.newaxis,np.newaxis]
+        
+        prob = prob.transpose((1, 2, 3, 0, 4))
+        root[input_path.name]['vector'][y_min:y_max, x_min:x_max, z:z + 1, 0:3, 0:1] = prob[y_overlap:y_max - y_min + y_overlap,
+                                                                                            x_overlap:x_max - x_min + x_overlap,
+                                                                                            ...]
+        
+    return True
 
-    This function downloads pretrained weights.
+def main(inpDir: Path,
+         pretrained_model: str,
+         diameter: float,
+         outDir: Path):
 
-    Args:
-        pretrained_model(str): Cyto/nuclei Segementation
-        urls(list): List of urls for model weights
-
-    """
-
-    # cellpose directory
-    start = 0
-    end = len(urls)
-    if pretrained_model == 'cyto':
-        end += 4
+    # Surround with try/finally for proper error catching
+    logger.info('Initializing ...')
+    # Get all file names in inpDir image collection
+    inpDir_files = [f.name for f in Path(inpDir).iterdir() if
+                    f.is_file() and "".join(f.suffixes) == '.ome.tif']
+    
+    # Use a gpu if it's available
+    use_gpu = torch.cuda.is_available()
+    if use_gpu:
+        dev = torch.device("cuda")
     else:
-        start += 5
-    urls = urls[start:end]
-    cp_dir = Path.home().joinpath('.cellpose')
-    cp_dir.mkdir(exist_ok=True)
-    model_dir = cp_dir.joinpath('models')
-    model_dir.mkdir(exist_ok=True)
+        dev = torch.device("cpu")
+    logger.info(f'Running on: {dev}')
 
-    for url in urls:
-        parts = urlparse(url)
-        filename = os.path.basename(parts.path)
-        cached_file = os.path.join(model_dir, filename)
-        if not os.path.exists(cached_file):
-            sys.stderr.write('Downloading: "{}" to {}\n'.format(url, cached_file))
-            download_url_to_file(url, cached_file, progress=True)
+    if pretrained_model in ['cyto','nuclei']:
+        model = models.Cellpose(model_type=pretrained_model,
+                                gpu=use_gpu,
+                                device=dev)
+        model_sz = model.sz
+        model_cp = model.cp
+    else:
+        model_cp = models.CellposeModel(pretrained_model=pretrained_model)
+        model_sz = None
+    model_cp.batch_size = 8
 
+    if diameter == 0 and pretrained_model in ['cyto', 'nuclei']:
+        diameter = None
+        logger.info('Estimating diameter for each image')
+    else:
+        diameter = args.diameter if args.diameter else model.diam_mean
+        logger.info('Using diameter %0.2f for all images' % diameter)
 
-def main():
-    # Initialize the logger
-    logging.basicConfig(format='%(asctime)s - %(name)-8s - %(levelname)-8s - %(message)s',
-                        datefmt='%d-%b-%y %H:%M:%S')
-    logger = logging.getLogger("main")
-    logger.setLevel(logging.INFO)
+    root = zarr.group(store=str(Path(outDir).joinpath('flow.zarr')))
+    
+    executor = ThreadPoolExecutor(1)
+    
+    for f in inpDir_files:
+        # Loop through files in inpDir image collection and process
+        br = BioReader(str(Path(inpDir).joinpath(f).absolute()))
+        logger.info('Processing image %s ', f)
+
+        # Saving pixel locations and probablity  as zarr datasets and metadata as string
+        cluster = root.create_group(f)
+        init_cluster_1 = cluster.create_dataset('vector', shape=(br.Y, br.X, br.Z, 2, 1),
+                                                chunks=(TILE_SIZE, TILE_SIZE, 1, 2, 1),
+                                                dtype=np.float32)
+        
+        cluster.attrs['metadata'] = str(br.metadata)
+        
+        # Iterating through z slices
+        processes = []
+        for z in range(br.Z):
+            # Iterating based on tile size
+            for x in range(0, br.X, TILE_SIZE):
+                for y in range(0, br.Y, TILE_SIZE):
+                    
+                    processes.append(executor.submit(segment_thread,
+                                                     Path(inpDir).joinpath(f).absolute(),
+                                                     str(Path(outDir).joinpath('flow.zarr')),
+                                                     x,y,z,
+                                                     model_cp,model_sz,
+                                                     diameter))
+                    
+    done, not_done = wait(processes, 0)
+
+    logger.info(f'Percent complete: {100 * len(done) / len(processes):6.3f}%')
+
+    while len(not_done) > 0:
+        for r in done:
+            r.result()
+        done, not_done = wait(processes, 15)
+        logger.info(f'Percent complete: {100 * len(done) / len(processes):6.3f}%')
+        
+    executor.shutdown()
+
+if __name__ == '__main__':
+    
     ''' Argument parsing '''
     logger.info("Parsing arguments...")
     parser = argparse.ArgumentParser(prog='main', description='Cellpose parameters')
 
     # Input arguments
-    parser.add_argument('--diameter', dest='diameter', type=float, default=30.,
+    parser.add_argument('--diameter', dest='diameter', type=float, default=0.,
                         help='Cell diameter, if 0 cellpose will estimate for each image',
                         required=False)
     parser.add_argument('--inpDir', dest='inpDir', type=str,
@@ -80,9 +161,11 @@ def main():
     # Output arguments
     parser.add_argument('--outDir', dest='outDir', type=str,
                         help='Output collection', required=True)
+    
     # Parse the arguments
     args = parser.parse_args()
     logger.info('diameter = {}'.format(args.diameter))
+    diameter = args.diameter
     inpDir = args.inpDir
     if (Path.is_dir(Path(args.inpDir).joinpath('images'))):
         # switch to images folder if present
@@ -92,86 +175,8 @@ def main():
     logger.info('pretrained model = {}'.format(pretrained_model))
     outDir = args.outDir
     logger.info('outDir = {}'.format(outDir))
-
-    # Surround with try/finally for proper error catching
-    try:
-        logger.info('Initializing ...')
-        # Get all file names in inpDir image collection
-        inpDir_files = [f.name for f in Path(inpDir).iterdir() if
-                        f.is_file() and "".join(f.suffixes) == '.ome.tif']
-        rescale = None
-
-        if pretrained_model in ['cyto', 'nuclei']:
-            logger.info('Running the images on %s model' % str(pretrained_model))
-            download_model_weights(pretrained_model)
-            model = models.Cellpose(model_type=pretrained_model)
-        elif Path(pretrained_model).exists():
-            model = models.CellposeModel(pretrained_model=pretrained_model)
-
-        else:
-            raise FileNotFoundError()
-
-        if args.diameter == 0:
-            if pretrained_model in ['cyto', 'nuclei']:
-                diameter = None
-                logger.info('Estimating diameter for each image')
-            else:
-                logger.info('Using user-specified model, no auto-diameter estimation available')
-                diameter = model.diam_mean
-        else:
-            diameter = args.diameter
-            logger.info('Using diameter %0.2f for all images' % diameter)
-
-        root = zarr.group(store=str(Path(outDir).joinpath('flow.zarr')))
-        for f in inpDir_files:
-            # Loop through files in inpDir image collection and process
-            br = BioReader(str(Path(inpDir).joinpath(f).absolute()))
-            logger.info('Processing image %s ', f)
-
-            # Saving pixel locations and probablity  as zarr datasets and metadata as string
-            cluster = root.create_group(f)
-            init_cluster_1 = cluster.create_dataset('vector', shape=(br.Y, br.X, br.Z, 3, 1),
-                                                    chunks=(TILE_SIZE, TILE_SIZE, 1, 3, 1),
-                                                    dtype=np.float32)
-            cluster.attrs['metadata'] = str(br.metadata)
-            # Iterating through z slices
-            for z in range(br.Z):
-                # Iterating based on tile size
-                for x in range(0, br.X, TILE_SIZE):
-                    for y in range(0, br.Y, TILE_SIZE):
-                        x_min = max([0, x - TILE_OVERLAP])
-                        x_max = min([br.X, x + TILE_SIZE + TILE_OVERLAP])
-                        y_min = max([0, y - TILE_OVERLAP])
-                        y_max = min([br.Y, y + TILE_SIZE + TILE_OVERLAP])
-                        tile_img = br[y_min:y_max, x_min:x_max, z:z + 1, 0, 0].squeeze()
-                        logger.info('Calculating flows on slice %d tile(y,x) %d :%d %d:%d ', z, y,
-                                    y_max, x, x_max)
-                        prob = model.eval(tile_img, diameter=diameter, rescale=rescale)
-                        x_overlap = x - x_min
-                        x_min = x
-                        x_max = min([br.X, x + TILE_SIZE])
-                        y_overlap = y - y_min
-                        y_min = y
-                        y_max = min([br.Y, y + TILE_SIZE])
-                        prob = prob[np.newaxis,]
-                        logger.info('Writing the vector field of  slice %d tile(y,x) %d :%d %d:%d ',
-                                    z, y, y_max, x, x_max)
-                        prob = prob[..., np.newaxis]
-                        prob = prob.transpose((1, 2, 0, 3, 4))
-                        root[f]['vector'][y_min:y_max, x_min:x_max, z:z + 1, 0:3, 0:1] = prob[
-                                                                                         y_overlap:y_max - y_min + y_overlap,
-                                                                                         x_overlap:x_max - x_min + x_overlap,
-                                                                                         ...]
-                        del prob
-
-    except FileNotFoundError:
-        logger.info('ERROR: model path missing or incorrect %s' % str(pretrained_model))
-    finally:
-        # Close the plugin regardless of successful completion
-        logger.info('Closing the plugin')
-        # Exit the program
-        sys.exit()
-
-
-if __name__ == '__main__':
-    main()
+    
+    main(inpDir,
+         pretrained_model,
+         diameter,
+         outDir)

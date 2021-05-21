@@ -1,6 +1,6 @@
   {
       "name": "Cellpose Inference",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "title": "Cellpose Inference",
       "description": "Semantic segmentation of cyto/nuclei",
       "author": "Sudharsan Prativadi (sudharsan.prativadi@labshare.org)",
@@ -8,7 +8,7 @@
       "repository": "https://github.com/labshare/polus-plugins-dl",
       "website": "https://ncats.nih.gov/preclinical/core/informatics",
       "citation": "Cellpose a generalist, deep learning-based segmentation algorithm which can very precisely segment a wide range of image types out-of-the-box and does not require model retraining or parameter adjustments, https://www.biorxiv.org/content/10.1101/2020.02.02.931238v1",
-      "containerId": "labshare/polus-cellpose-inference-plugin:0.4.0",
+      "containerId": "labshare/polus-cellpose-inference-plugin:0.5.0",
       "inputs": [
         {
           "name": "diameter",

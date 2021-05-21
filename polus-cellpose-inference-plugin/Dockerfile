@@ -1,11 +1,9 @@
-FROM pytorch/pytorch:1.6.0-cuda10.1-cudnn7-devel
+FROM pytorch/pytorch:1.7.1-cuda11.0-cudnn8-runtime
 
 COPY VERSION /
 
 ARG EXEC_DIR="/opt/executables"
 ARG DATA_DIR="/data"
-
-RUN apt-get update
 
 RUN pip install --upgrade pip --no-cache-dir
 
@@ -16,8 +14,16 @@ RUN mkdir -p ${EXEC_DIR} \
 COPY src ${EXEC_DIR}/
 WORKDIR ${EXEC_DIR}
 
-RUN apt-get -y install libgomp1 gfortran libglib2.0.0 libgles2-mesa-dev
+RUN pip3 install -r ${EXEC_DIR}/requirements.txt --no-cache-dir
 
-RUN  pip install  -r ${EXEC_DIR}/requirements.txt --no-cache-dir
+ARG HOME=/
+
+RUN python -c "import cellpose.models"
+
+RUN mkdir ${EXEC_DIR}/numba_cache && \
+    chmod 777 ${EXEC_DIR}/numba_cache && \
+    chmod -R 777 /.cellpose
+
+ARG NUMBA_CACHE_DIR=${EXEC_DIR}/numba_cache
 
 ENTRYPOINT ["python3", "main.py"]
