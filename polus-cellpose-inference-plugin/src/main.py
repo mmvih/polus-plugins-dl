@@ -9,6 +9,7 @@ import cellpose.models as models
 import torch
 from concurrent.futures import ThreadPoolExecutor, wait
 import typing
+from queue import Queue
 
 """ Silence Cellpose
 
@@ -20,14 +21,21 @@ logging.getLogger('cellpose.core').setLevel(logging.CRITICAL)
 logging.getLogger('cellpose.models').setLevel(logging.CRITICAL)
 logging.getLogger('cellpose.io').setLevel(logging.CRITICAL)
 
-TILE_SIZE = 1024
-TILE_OVERLAP = 256
-
 # Initialize the logger
 logging.basicConfig(format='%(asctime)s - %(name)-8s - %(levelname)-8s - %(message)s',
                     datefmt='%d-%b-%y %H:%M:%S')
 logger = logging.getLogger("main")
 logger.setLevel(logging.INFO)
+
+TILE_SIZE = 1024
+TILE_OVERLAP = 64 # The expected object diameter should be 30 at most
+
+# Use a gpu if it's available
+USE_GPU = torch.cuda.is_available()
+if USE_GPU:
+    DEV = [torch.device(f"cuda:{g}") for g in range(torch.cuda.device_count())]
+else:
+    DEV = [torch.device("cpu")]
 
 # Conversion factors to nm, these are based off of supported Bioformats length units
 UNITS = {'m':  10**-6,
@@ -39,8 +47,8 @@ UNITS = {'m':  10**-6,
 def segment_thread(input_path: Path,
                    zfile: Path,
                    position: typing.Tuple[int,int,int],
-                   model_cp: models.CellposeModel,
-                   model_sz: models.CellposeModel,
+                   model_cp_queue: Queue,
+                   model_sz_queue: Queue,
                    diameter: int):
     """ Run cellpose on an image tile
 
@@ -58,6 +66,7 @@ def segment_thread(input_path: Path,
 
     x,y,z = position
     
+    
     root = zarr.open(str(zfile))
     
     with BioReader(input_path) as br:
@@ -69,15 +78,19 @@ def segment_thread(input_path: Path,
         img = cellpose.transforms.convert_image(tile_img,[0,0],False,True,False)
         
         if diameter in [None,0]:
+            model_sz = model_sz_queue.get()
             diameter,_ = model_sz.eval(tile_img,
                                        channels=[0,0])
+            model_sz_queue.put(model_sz)
         
+        model_cp = model_cp_queue.get()
         rescale = model_cp.diam_mean / np.array(diameter)
             
         dP,prob = model_cp._run_cp(img[np.newaxis,...],
                                    rescale=rescale,
                                    resample=True,
                                    compute_masks=False)[2:4]
+        model_cp_queue.put(model_cp)
         
         x_overlap = x - x_min
         x_min = x
@@ -106,31 +119,29 @@ def main(inpDir: Path,
     
     """ Sanity check on diameter mode """
     assert diameterMode in ['Manual','PixelSize','FirstImage','EveryImage']
-
-    # Surround with try/finally for proper error catching
-    logger.info('Initializing ...')
+    
     # Get all file names in inpDir image collection
     inpDir_files = [f for f in Path(inpDir).iterdir() if f.is_file()]
-    
-    # Use a gpu if it's available
-    use_gpu = torch.cuda.is_available()
-    if use_gpu:
-        dev = torch.device("cuda")
-    else:
-        dev = torch.device("cpu")
-    logger.info(f'Running on: {dev}')
 
     # Get the pretrained model
+    model_cp = Queue(len(DEV))
+    model_sz = Queue(len(DEV))
     if pretrained_model in ['cyto','cyto2','nuclei']:
-        model = models.Cellpose(model_type=pretrained_model,
-                                gpu=use_gpu,
-                                device=dev)
-        model_sz = model.sz
-        model_cp = model.cp
+        
+        for dev in DEV:
+            model = models.Cellpose(model_type=pretrained_model,
+                                    gpu=USE_GPU,
+                                    device=dev)
+            model_sz.put(model.sz)
+            model_cp.put(model.cp)
+            
     else:
-        model_cp = models.CellposeModel(pretrained_model=pretrained_model)
-        model_sz = None
-    model_cp.batch_size = 8
+        
+        for dev in DEV:
+            model_cp.put(models.CellposeModel(pretrained_model=pretrained_model,
+                                            gpu=USE_GPU,
+                                            device=dev))
+            model_sz.put(None)
 
     # Error checking for diameterMode==Manual
     if diameterMode=='Manual' and not diameter:
@@ -145,7 +156,8 @@ def main(inpDir: Path,
 
     root = zarr.group(store=str(Path(outDir).joinpath('flow.zarr')))
     
-    executor = ThreadPoolExecutor(1)
+    executor = ThreadPoolExecutor(2*len(DEV))
+    logger.info(f'Running {2*len(DEV)} workers on: {DEV}')
     
     if diameterMode == 'FirstImage':
         
@@ -158,14 +170,15 @@ def main(inpDir: Path,
             
             tile_img = br[y_min:y_max,x_min:x_max,...]
             
-            diameter,_ = model_sz.eval(tile_img,
-                                       channels=[0,0])
-            
+            _model_sz = model_sz.get()
+            diameter,_ = _model_sz.eval(tile_img,
+                                        channels=[0,0])
+            model_sz.put(_model_sz)
     
     # Loop through files in inpDir image collection and process
     for f in inpDir_files:
-        br = BioReader(Path(inpDir).joinpath(f).absolute())
-        logger.info(f'Processing image {f}, diameter = {diameter}')
+        br = BioReader(f.absolute())
+        logger.debug(f'Processing image {f}, diameter = {diameter:.2f}')
         
         # If diameterMode == PixelSize, estimate diameter from pixel size
         if diameterMode=='PixelSize':
@@ -188,6 +201,7 @@ def main(inpDir: Path,
                 diameter *= model.diam_mean
             except Exception as err:
                 logger.error('Manual diameter selected, but not diameter supplied and model has no default diameter.')
+                raise
 
         # Saving pixel locations and probablity as zarr datasets and metadata as string
         cluster = root.create_group(f.name)
