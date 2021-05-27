@@ -21,9 +21,9 @@ ARG HOME=/
 RUN python -c "import cellpose.models"
 
 RUN mkdir ${EXEC_DIR}/numba_cache && \
-    chmod 777 ${EXEC_DIR}/numba_cache && \
+    chmod -R 777 ${EXEC_DIR}/numba_cache && \
     chmod -R 777 /.cellpose
 
-ARG NUMBA_CACHE_DIR=${EXEC_DIR}/numba_cache
+ENV NUMBA_CACHE_DIR=${EXEC_DIR}/numba_cache
 
 ENTRYPOINT ["python3", "main.py"]

@@ -7,7 +7,7 @@
       "institution": "National Center for Advancing Translational Sciences, National Institutes of Health",
       "repository": "https://github.com/labshare/polus-plugins-dl",
       "website": "https://ncats.nih.gov/preclinical/core/informatics",
-      "citation": "Cellpose a generalist, deep learning-based segmentation algorithm which can very precisely segment a wide range of image types out-of-the-box and does not require model retraining or parameter adjustments, https://www.biorxiv.org/content/10.1101/2020.02.02.931238v1",
+      "citation": "https://www.biorxiv.org/content/10.1101/2020.02.02.931238v1",
       "containerId": "labshare/polus-cellpose-inference-plugin:0.5.0",
       "inputs": [
         {
@@ -28,18 +28,19 @@
           "description": "Choose cyto/nuclei to segment.",
           "options": {
             "values": [
-                  "cyto",
-               "nuclei",
-              "custom"
-               ]
+                "cyto",
+                "nuclei",
+                "custom"
+              ]
             },
           "required": true
         },
-        {"name": "cpretrainedModel" ,
-                "type": "tensorflowModel",
-                "description": "Choose the custom pretrained model.",
-                "required": true
-              }
+        {
+          "name": "cpretrainedModel" ,
+          "type": "tensorflowModel",
+          "description": "Choose the custom pretrained model.",
+          "required": true
+        }
       ],
       "outputs": [
         {
