@@ -1,21 +1,48 @@
-import argparse
-import logging
+# core libraries
+import argparse, logging, typing
+from concurrent.futures import wait, ProcessPoolExecutor
+from multiprocessing import Queue
 from pathlib import Path
+
+# third party libraries
 import numpy as np
 import zarr
 from bfio import BioReader
 import cellpose
 import cellpose.models as models
 import torch
-from concurrent.futures import ThreadPoolExecutor, wait
-import typing
-from queue import Queue
+import filepattern
 
-""" Silence Cellpose
+# Setup pytorch for multiprocessing
+torch.multiprocessing.set_start_method('spawn',force=True)
 
+""" Global Settings """
+TILE_SIZE = 1024
+TILE_OVERLAP = 64 # The expected object diameter should be 30 at most
+
+# Use a gpu if it's available
+USE_GPU = torch.cuda.is_available()
+if USE_GPU:
+    DEV = Queue(torch.cuda.device_count())
+    for dev in range(torch.cuda.device_count()):
+        DEV.put(torch.device(f"cuda:{dev}"))
+else:
+    DEV = Queue(1)
+    DEV.put(torch.device("cpu"))
+
+# Conversion factors to nm, these are based off of supported Bioformats length units
+UNITS = {'m':  10**-6,
+         'cm': 10**-4,
+         'mm': 10**-3,
+         'µm': 10,
+         'nm': 10**3}
+
+model_cp = None
+model_sz = None
+
+"""
 Cellpose does not give you an option to set log level. We have to manually set
 the log levels to prevent Cellpose from spamming the command line.
-
 """
 logging.getLogger('cellpose.core').setLevel(logging.CRITICAL)
 logging.getLogger('cellpose.models').setLevel(logging.CRITICAL)
@@ -27,28 +54,42 @@ logging.basicConfig(format='%(asctime)s - %(name)-8s - %(levelname)-8s - %(messa
 logger = logging.getLogger("main")
 logger.setLevel(logging.INFO)
 
-TILE_SIZE = 1024
-TILE_OVERLAP = 64 # The expected object diameter should be 30 at most
+def initialize_model(dev: Queue,
+                     pretrained_model: str):
+    """ Initialize the cellpose model within a worker
 
-# Use a gpu if it's available
-USE_GPU = torch.cuda.is_available()
-if USE_GPU:
-    DEV = [torch.device(f"cuda:{g}") for g in range(torch.cuda.device_count())]
-else:
-    DEV = [torch.device("cpu")]
+    This function is designed to be run as the initializer for a
+    ProcessPoolExecutor. The size model and cellpose segmentation models are
+    stored inside each process as a global variable that can be called by the
+    segmentation thread.
 
-# Conversion factors to nm, these are based off of supported Bioformats length units
-UNITS = {'m':  10**-6,
-         'cm': 10**-4,
-         'mm': 10**-3,
-         'µm': 10,
-         'nm': 10**3}
+    Args:
+        dev (Queue[torch.device]): A Queue holding the available devices
+        pretrained_model (str): The name or path of the model
+    """    
+    
+    global model_sz
+    global model_cp
+    
+    if pretrained_model in ['cyto','cyto2','nuclei']:
+        
+        model = models.Cellpose(model_type=pretrained_model,
+                                gpu=USE_GPU,
+                                device=dev.get())
+        model_sz = model.sz
+        model_cp = model.cp
+            
+    else:
+        
+        model_cp = models.CellposeModel(pretrained_model=pretrained_model,
+                                        gpu=USE_GPU,
+                                        device=dev.get())
+    
+    model_cp.batch_size = 8
 
 def segment_thread(input_path: Path,
                    zfile: Path,
                    position: typing.Tuple[int,int,int],
-                   model_cp_queue: Queue,
-                   model_sz_queue: Queue,
                    diameter: int):
     """ Run cellpose on an image tile
 
@@ -56,8 +97,6 @@ def segment_thread(input_path: Path,
         input_path (Path): Path to input file
         zfile (Path): Path to the zarr file
         position (typing.Tuple[int,int,int]): x,y,z coordinates of tile
-        model_cp (models.CellposeModel): Cellpose segmentation model
-        model_sz (models.CellposeModel): Cellpose size model
         diameter (int): Diameter of objects in image
 
     Returns:
@@ -65,7 +104,6 @@ def segment_thread(input_path: Path,
     """    
 
     x,y,z = position
-    
     
     root = zarr.open(str(zfile))
     
@@ -78,19 +116,15 @@ def segment_thread(input_path: Path,
         img = cellpose.transforms.convert_image(tile_img,[0,0],False,True,False)
         
         if diameter in [None,0]:
-            model_sz = model_sz_queue.get()
             diameter,_ = model_sz.eval(tile_img,
                                        channels=[0,0])
-            model_sz_queue.put(model_sz)
         
-        model_cp = model_cp_queue.get()
         rescale = model_cp.diam_mean / np.array(diameter)
             
         dP,prob = model_cp._run_cp(img[np.newaxis,...],
                                    rescale=rescale,
                                    resample=True,
                                    compute_masks=False)[2:4]
-        model_cp_queue.put(model_cp)
         
         x_overlap = x - x_min
         x_min = x
@@ -115,49 +149,43 @@ def main(inpDir: Path,
          pretrained_model: str,
          diameterMode: str,
          diameter: float,
+         filePattern: str,
          outDir: Path):
     
     """ Sanity check on diameter mode """
     assert diameterMode in ['Manual','PixelSize','FirstImage','EveryImage']
     
     # Get all file names in inpDir image collection
-    inpDir_files = [f for f in Path(inpDir).iterdir() if f.is_file()]
-
-    # Get the pretrained model
-    model_cp = Queue(len(DEV))
-    model_sz = Queue(len(DEV))
-    if pretrained_model in ['cyto','cyto2','nuclei']:
-        
-        for dev in DEV:
-            model = models.Cellpose(model_type=pretrained_model,
-                                    gpu=USE_GPU,
-                                    device=dev)
-            model_sz.put(model.sz)
-            model_cp.put(model.cp)
-            
-    else:
-        
-        for dev in DEV:
-            model_cp.put(models.CellposeModel(pretrained_model=pretrained_model,
-                                            gpu=USE_GPU,
-                                            device=dev))
-            model_sz.put(None)
+    fp = filepattern.FilePattern(inpDir,filePattern)
+    inpDir_files = [f[0]['file'] for f in fp]
 
     # Error checking for diameterMode==Manual
     if diameterMode=='Manual' and not diameter:
         logger.warning('Manual diameter selection specified, but manual diameter is 0 or None. Using Cellpose model defaults.')
         
         try:
+            d = DEV.get()
+            model = models.Cellpose(model_type=pretrained_model,
+                                    gpu=USE_GPU,
+                                    device=d)
+            DEV.put(d)
             diameter = model.diam_mean
+            
         except Exception as err:
             logger.error('Manual diameter selected, but not diameter supplied and model has no default diameter.')
+            raise err
+        
     elif diameterMode=='EveryImage':
         diameter = 0
 
     root = zarr.group(store=str(Path(outDir).joinpath('flow.zarr')))
     
-    executor = ThreadPoolExecutor(2*len(DEV))
-    logger.info(f'Running {2*len(DEV)} workers on: {DEV}')
+    # Initialize the process pool
+    executor = ProcessPoolExecutor(DEV.qsize(),
+                                   initializer=initialize_model,
+                                   initargs=(DEV,pretrained_model))
+    
+    logger.info(f'Running {DEV.qsize()} workers')
     
     if diameterMode == 'FirstImage':
         
@@ -170,12 +198,16 @@ def main(inpDir: Path,
             
             tile_img = br[y_min:y_max,x_min:x_max,...]
             
-            _model_sz = model_sz.get()
-            diameter,_ = _model_sz.eval(tile_img,
-                                        channels=[0,0])
-            model_sz.put(_model_sz)
+            d = DEV.get()
+            model = models.Cellpose(model_type=pretrained_model,
+                                    gpu=USE_GPU,
+                                    device=d)
+            diameter,_ = model.sz.eval(tile_img,
+                                       channels=[0,0])
+            DEV.put(d)
     
     # Loop through files in inpDir image collection and process
+    processes = []
     for f in inpDir_files:
         br = BioReader(f.absolute())
         logger.debug(f'Processing image {f}, diameter = {diameter:.2f}')
@@ -201,7 +233,7 @@ def main(inpDir: Path,
                 diameter *= model.diam_mean
             except Exception as err:
                 logger.error('Manual diameter selected, but not diameter supplied and model has no default diameter.')
-                raise
+                raise err
 
         # Saving pixel locations and probablity as zarr datasets and metadata as string
         cluster = root.create_group(f.name)
@@ -212,8 +244,8 @@ def main(inpDir: Path,
         cluster.attrs['metadata'] = str(br.metadata)
         
         # Iterating through z slices
-        processes = []
         for z in range(br.Z):
+            
             # Iterating based on tile size
             for x in range(0, br.X, TILE_SIZE):
                 for y in range(0, br.Y, TILE_SIZE):
@@ -223,8 +255,6 @@ def main(inpDir: Path,
                                                      f,
                                                      Path(outDir).joinpath('flow.zarr'),
                                                      position,
-                                                     model_cp,
-                                                     model_sz,
                                                      diameter))
                     
         # Close the image
@@ -233,12 +263,14 @@ def main(inpDir: Path,
     done, not_done = wait(processes, 0)
 
     logger.info(f'Percent complete: {100 * len(done) / len(processes):6.3f}%')
+    for r in done:
+        r.result()
 
     while len(not_done) > 0:
-        for r in done:
-            r.result()
         done, not_done = wait(processes, 15)
         logger.info(f'Percent complete: {100 * len(done) / len(processes):6.3f}%')
+        for r in done:
+            r.result()
         
     executor.shutdown()
 
@@ -249,16 +281,19 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='main', description='Cellpose parameters')
 
     # Input arguments
+    parser.add_argument('--filePattern', dest='filePattern', type=str, default='.*',
+                        help='File pattern for selecting files to segment.',
+                        required=False)
     parser.add_argument('--diameterMode', dest='diameterMode', type=str, default='FirstImage',
                         help='Method of setting diameter. Must be one of PixelSize, Manual, FirstImage, EveryImage',
-                        required=False)
+                        required=True)
     parser.add_argument('--diameter', dest='diameter', type=float, default=0.,
                         help='Cell diameter, if 0 cellpose will estimate for each image',
                         required=False)
     parser.add_argument('--inpDir', dest='inpDir', type=str,
                         help='Input image collection to be processed by this plugin', required=True)
     parser.add_argument('--pretrainedModel', dest='pretrainedModel', type=str,
-                        help='Model to use', required=False)
+                        help='Model to use', required=True)
 
     # Output arguments
     parser.add_argument('--outDir', dest='outDir', type=str,
@@ -268,20 +303,28 @@ if __name__ == '__main__':
     args = parser.parse_args()
     logger.info('diameter = {}'.format(args.diameter))
     diameter = args.diameter
+    
     logger.info('diameterMode = {}'.format(args.diameterMode))
     diameterMode = args.diameterMode
+    
     inpDir = args.inpDir
     if (Path.is_dir(Path(args.inpDir).joinpath('images'))):
         # switch to images folder if present
         inpDir = str(Path(args.inpDir).joinpath('images').absolute())
     logger.info('inpDir = {}'.format(inpDir))
+    
     pretrained_model = args.pretrainedModel
     logger.info('pretrained model = {}'.format(pretrained_model))
+    
     outDir = args.outDir
     logger.info('outDir = {}'.format(outDir))
+    
+    filePattern = args.filePattern
+    logger.info('filePattern = {}'.format(filePattern))
     
     main(inpDir,
          pretrained_model,
          diameterMode,
          diameter,
+         filePattern,
          outDir)

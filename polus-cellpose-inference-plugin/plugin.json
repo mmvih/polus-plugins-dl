@@ -1,6 +1,6 @@
   {
       "name": "Cellpose Inference",
-      "version": "0.5.0",
+      "version": "0.6.1",
       "title": "Cellpose Inference",
       "description": "Semantic segmentation of cyto/nuclei",
       "author": "Sudharsan Prativadi (sudharsan.prativadi@labshare.org)",
@@ -8,14 +8,8 @@
       "repository": "https://github.com/labshare/polus-plugins-dl",
       "website": "https://ncats.nih.gov/preclinical/core/informatics",
       "citation": "https://www.biorxiv.org/content/10.1101/2020.02.02.931238v1",
-      "containerId": "labshare/polus-cellpose-inference-plugin:0.5.0",
+      "containerId": "labshare/polus-cellpose-inference-plugin:0.6.1",
       "inputs": [
-        {
-          "name": "diameter",
-          "type": "integer",
-          "description": "Select the diameter value for all images. Enter 0 for the plugin to predict diameter for each image.",
-          "required": false
-        },
         {
           "name": "inpDir",
           "type": "collection",
@@ -23,22 +17,41 @@
           "required": true
         },
         {
+          "name": "filePattern",
+          "type": "string",
+          "description": "Filepattern used to select files for segmentation.",
+          "required": true
+        },
+        {
+          "name": "diameterMode",
+          "type": "enum",
+          "description": "Diameter Mode",
+          "options": {
+            "values": [
+                "FirstImage",
+                "EveryImage",
+                "PixelSize",
+                "Manual"
+            ]
+          }
+        },
+        {
+          "name": "diameter",
+          "type": "integer",
+          "description": "Select the diameter value for all images. Enter 0 for the plugin to predict diameter for each image.",
+          "required": false
+        },
+        {
           "name": "pretrainedModel",
           "type": "enum",
           "description": "Choose cyto/nuclei to segment.",
           "options": {
             "values": [
-                "cyto",
                 "nuclei",
-                "custom"
+                "cyto",
+                "cyto2"
               ]
             },
-          "required": true
-        },
-        {
-          "name": "cpretrainedModel" ,
-          "type": "tensorflowModel",
-          "description": "Choose the custom pretrained model.",
           "required": true
         }
       ],
@@ -57,9 +70,9 @@
         },
 
         {
-          "key": "inputs.diameter",
-          "title": "Diameter",
-          "description": "Select the diameter value for all images. Enter 0 for the plugin to predict diameter for each image."
+          "key": "inputs.filePattern",
+          "title": "File Pattern",
+          "description": "File pattern to select images for segmentation."
         },
 
         {
@@ -67,11 +80,18 @@
           "title": "Model to use(Cyto/nuclei)",
           "description": "Type of segmentation."
         },
+
         {
-          "key": "inputs.cpretrainedModel",
-          "title": "Pretrained Model of choice",
-          "description": "Choose the custom pretrained model.",
-          "condition": "model.inputs.pretrainedModel=='custom'"
+          "key": "inputs.diameterMode",
+          "title": "Diameter Mode",
+          "description": "Method used to estimate cell nucleus/cytoplasm diameter."
+        },
+
+        {
+          "key": "inputs.diameter",
+          "title": "Diameter",
+          "description": "Select the diameter value for all images. Enter 0 for the plugin to predict diameter for each image.",
+          "condition": "model.inputs.diameterMode=='Manual'"
         }
       ]
     }
