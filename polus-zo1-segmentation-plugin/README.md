@@ -28,7 +28,7 @@ This plugin takes one input argument and one output argument:
 
 ## Example Code 
 
-Getting Z01 Flurorescent Data from Publication\
+Getting Z01 Flurorescent Data from Publication
 ```Linux
 wget "https://isg.nist.gov/deepzoomweb/dissemination/rpecells/fluorescentZ01.zip"
 unzip fluorescentZ01.zip
